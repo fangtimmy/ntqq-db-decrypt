@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local decrypted databases and exports
+exported_all/
+decrypted/
+*.plain.db
