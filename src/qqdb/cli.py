@@ -1,17 +1,16 @@
-"""Command line interface for the QQ database reader."""
+"""Command line interface for the QQ database reader and exporter."""
 
 from __future__ import annotations
 
 import argparse
 import sys
-from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from . import login, memscan, ntdb
-from . import text as message_text
-from .sqlcipher import Database, SqlCipherError
+from . import export, login, memscan, model, ntdb
+from .ntdb import open_database
+from .sqlcipher import SqlCipherError
 
 
 def _scan_entries() -> tuple[list[int], list[ntdb.KeyEntry]]:
@@ -19,12 +18,8 @@ def _scan_entries() -> tuple[list[int], list[ntdb.KeyEntry]]:
     return pids, ntdb.key_entries(candidates)
 
 
-def _matched_databases(account: ntdb.Account, entries: list[ntdb.KeyEntry]) -> list[tuple[Path, str | None]]:
-    result = []
-    for db_path in account.databases():
-        salt = ntdb.database_salt(db_path)
-        result.append((db_path, salt))
-    return result
+def _matched_databases(account: ntdb.Account) -> list[tuple[Path, str | None]]:
+    return [(db_path, ntdb.database_salt(db_path)) for db_path in account.databases()]
 
 
 def _pick_account(
@@ -35,7 +30,7 @@ def _pick_account(
     scored = []
     for account in accounts:
         score = 0
-        for db_path, salt in _matched_databases(account, entries):
+        for db_path, salt in _matched_databases(account):
             if salt and ntdb.key_for_salt(entries, salt):
                 score += 1
         scored.append((score, account))
@@ -45,27 +40,16 @@ def _pick_account(
     return scored[0][1]
 
 
-@contextmanager
-def open_database(account: ntdb.Account, db_name: str, entries: list[ntdb.KeyEntry]):
-    db_path = account.db_dir / db_name
-    if not db_path.is_file():
-        raise SystemExit(f"database not found: {db_path}")
-    salt = ntdb.database_salt(db_path)
-    entry = ntdb.key_for_salt(entries, salt) if salt else None
-    if entry is None:
-        raise SystemExit(
-            f"no key in process memory for {db_path.name} (salt={salt}); "
-            "this account is probably logged out"
-        )
-    copy = ntdb.DecryptedCopy(db_path)
-    database: Database | None = None
+def _parse_time(value: str | None) -> int | None:
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return int(value)
     try:
-        database = Database(copy.path, entry.key)
-        yield database
-    finally:
-        if database is not None:
-            database.close()
-        copy.cleanup()
+        return int(datetime.fromisoformat(value).timestamp())
+    except ValueError as exc:
+        raise SystemExit(f"invalid time {value!r}; use unix seconds or YYYY-MM-DD[ HH:MM:SS]") from exc
 
 
 def _format_cell(value: Any, full: bool) -> str:
@@ -109,7 +93,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         matched = 0
         total = 0
         details = []
-        for db_path, salt in _matched_databases(account, entries):
+        for db_path, salt in _matched_databases(account):
             if not salt:
                 continue
             total += 1
@@ -134,7 +118,7 @@ def cmd_accounts(_args: argparse.Namespace) -> int:
     for account in accounts:
         identity = login.label(identities.get(account.name))
         print(f"\n{account.name}" + (f"  [{identity}]" if identity else ""))
-        for db_path, salt in _matched_databases(account, entries):
+        for db_path, salt in _matched_databases(account):
             entry = ntdb.key_for_salt(entries, salt) if salt else None
             print(f"  {db_path.name:28} salt={salt or '-':32} key={'yes' if entry else 'no'}")
     return 0
@@ -167,58 +151,94 @@ def cmd_query(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_name_maps(account: ntdb.Account, entries: list[ntdb.KeyEntry]):
-    nicknames: dict[str, str] = {}
-    with open_database(account, "profile_info.db", entries) as database:
-        _, rows = database.query('SELECT "1000","20002" FROM profile_info_v6;')
-        for uid, nickname in rows:
-            if uid and nickname:
-                nicknames[str(uid)] = str(nickname)
-    groups: dict[str, str] = {}
-    with open_database(account, "group_info.db", entries) as database:
-        _, rows = database.query('SELECT "60001","60007" FROM group_list;')
-        for code, name in rows:
-            if code and name:
-                groups[str(code)] = str(name)
-    return nicknames, groups
-
-
 def cmd_messages(args: argparse.Namespace) -> int:
     _, entries = _scan_entries()
     account = _pick_account(ntdb.accounts(), entries, args.account)
-    nicknames, groups = _load_name_maps(account, entries)
-    tables = []
-    if args.kind in ("c2c", "all"):
-        tables.append(("c2c", "c2c_msg_table"))
-    if args.kind in ("group", "all"):
-        tables.append(("group", "group_msg_table"))
+    directory = model.load_directory(account, entries)
+    conversations = model.collect_conversations(
+        account,
+        entries,
+        directory,
+        kind=args.kind,
+        since=_parse_time(args.since),
+        until=_parse_time(args.until),
+    )
+    if args.chat:
+        conversations = model.filter_conversations(conversations, args.chat)
+        if not conversations:
+            raise SystemExit(f"no conversation matches {args.chat!r}")
+    messages = [message for conversation in conversations for message in conversation.messages]
+    messages.sort(key=lambda message: (message.timestamp, message.seq), reverse=True)
+    rows = [
+        (message.time, message.chat_name, message.sender_name, message.msg_type, message.text)
+        for message in messages[: args.limit]
+    ]
+    _print_table(("time", "chat", "sender", "type", "text"), rows, args.full)
+    return 0
 
-    collected: list[tuple[int, str, tuple[Any, ...]]] = []
-    with open_database(account, "nt_msg.db", entries) as database:
-        for kind, table in tables:
-            _, rows = database.query(
-                f'SELECT "40001","40050","40011","40020","40021","40800" '
-                f'FROM "{table}" ORDER BY "40050" DESC LIMIT {args.limit};'
-            )
-            for row in rows:
-                collected.append((int(row[1] or 0), kind, row))
-    collected.sort(key=lambda item: item[0], reverse=True)
 
-    rendered = []
-    for timestamp, kind, row in collected[: args.limit]:
-        when = (
-            datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
-            if timestamp > 0
-            else "-"
+def cmd_chats(args: argparse.Namespace) -> int:
+    _, entries = _scan_entries()
+    account = _pick_account(ntdb.accounts(), entries, args.account)
+    directory = model.load_directory(account, entries)
+    conversations = model.collect_conversations(
+        account,
+        entries,
+        directory,
+        kind=args.kind,
+        since=_parse_time(args.since),
+        until=_parse_time(args.until),
+        limit_per_chat=args.messages,
+    )
+    if args.search:
+        conversations = model.filter_conversations(conversations, args.search)
+    if args.limit:
+        conversations = conversations[: args.limit]
+    rows = [
+        (
+            conversation.chat_type,
+            conversation.chat_id,
+            conversation.name,
+            conversation.count,
+            conversation.first_iso,
+            conversation.last_iso,
         )
-        body = row[5] if isinstance(row[5], (bytes, bytearray)) else b""
-        extracted = message_text.join_text(body, max_items=1000 if args.full else 6)
-        sender = str(row[3] or "")
-        chat = str(row[4] or "")
-        sender = nicknames.get(sender, sender)
-        chat = groups.get(chat, chat) if kind == "group" else nicknames.get(chat, chat)
-        rendered.append((when, kind, sender, chat, row[2], extracted or "(no text)"))
-    _print_table(("time", "kind", "sender_uid", "chat", "type", "text"), rendered, True)
+        for conversation in conversations
+    ]
+    _print_table(("type", "chat_id", "name", "messages", "first", "last"), rows, True)
+    print(
+        f"\n{len(conversations)} conversations, "
+        f"{sum(conversation.count for conversation in conversations)} messages"
+    )
+    return 0
+
+
+def cmd_export_chats(args: argparse.Namespace) -> int:
+    _, entries = _scan_entries()
+    account = _pick_account(ntdb.accounts(), entries, args.account)
+    directory = model.load_directory(account, entries)
+    conversations = model.collect_conversations(
+        account,
+        entries,
+        directory,
+        kind=args.kind,
+        since=_parse_time(args.since),
+        until=_parse_time(args.until),
+    )
+    if args.chat:
+        conversations = model.filter_conversations(conversations, args.chat)
+        if not conversations:
+            raise SystemExit(f"no conversation matches {args.chat!r}")
+    result = export.export_conversations(
+        conversations,
+        args.out,
+        formats=args.format,
+        overwrite=args.force,
+    )
+    print(
+        f"exported {result['messages']} messages from {result['conversations']} "
+        f"conversations to {result['output']} ({', '.join(result['formats'])})"
+    )
     return 0
 
 
@@ -250,7 +270,7 @@ def cmd_info(args: argparse.Namespace) -> int:
     print(f"key recovered: {'yes' if entry else 'no'}")
     if entry:
         with open_database(account, args.db, entries) as database:
-            columns, rows = database.query("PRAGMA page_count;")
+            _, rows = database.query("PRAGMA page_count;")
             print(f"pages: {rows[0][0] if rows else '?'}")
             print(f"tables: {len(database.tables())}")
     return 0
@@ -259,8 +279,8 @@ def cmd_info(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="qqdb",
-        description="Read NTQQ SQLCipher databases using a read-only memory scan "
-        "(no injection, no hooks).",
+        description="Read and export NTQQ SQLCipher databases using a read-only "
+        "memory scan (no injection, no hooks).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -290,18 +310,44 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--full", action="store_true", help="do not truncate cell values")
     query.set_defaults(func=cmd_query)
 
-    messages = sub.add_parser("messages", help="show recent messages with extracted text")
+    messages = sub.add_parser("messages", help="show recent messages with structured content")
     messages.add_argument("--account", help="account directory name or unique substring")
     messages.add_argument("--kind", choices=("c2c", "group", "all"), default="all")
+    messages.add_argument("--chat", help="only this chat id, name or name substring")
     messages.add_argument("--limit", type=int, default=20)
-    messages.add_argument("--full", action="store_true", help="do not truncate extracted strings")
+    messages.add_argument("--since", help="unix seconds or ISO date/time")
+    messages.add_argument("--until", help="unix seconds or ISO date/time")
+    messages.add_argument("--full", action="store_true", help="do not truncate text")
     messages.set_defaults(func=cmd_messages)
 
-    export = sub.add_parser("export", help="export a decrypted copy as plain SQLite")
-    export.add_argument("--out", required=True)
-    export.add_argument("--account", help="account directory name or unique substring")
-    export.add_argument("--db", default="nt_msg.db")
-    export.set_defaults(func=cmd_export)
+    chats = sub.add_parser("chats", help="list conversations with message counts")
+    chats.add_argument("--account", help="account directory name or unique substring")
+    chats.add_argument("--kind", choices=("c2c", "group", "all"), default="all")
+    chats.add_argument("--search", help="filter by chat name or id")
+    chats.add_argument("--limit", type=int, default=50, help="maximum conversations to list")
+    chats.add_argument("--messages", type=int, help="keep only the latest N messages per chat")
+    chats.add_argument("--since", help="unix seconds or ISO date/time")
+    chats.add_argument("--until", help="unix seconds or ISO date/time")
+    chats.set_defaults(func=cmd_chats)
+
+    export_chats = sub.add_parser(
+        "export-chats", help="export conversations to TXT/CSV/JSON/JSONL"
+    )
+    export_chats.add_argument("--out", required=True, help="output directory")
+    export_chats.add_argument("--account", help="account directory name or unique substring")
+    export_chats.add_argument("--kind", choices=("c2c", "group", "all"), default="all")
+    export_chats.add_argument("--chat", help="only this chat id, name or name substring")
+    export_chats.add_argument("--format", default="txt,csv,json,jsonl")
+    export_chats.add_argument("--since", help="unix seconds or ISO date/time")
+    export_chats.add_argument("--until", help="unix seconds or ISO date/time")
+    export_chats.add_argument("--force", action="store_true", help="allow a non-empty output directory")
+    export_chats.set_defaults(func=cmd_export_chats)
+
+    export_db = sub.add_parser("export", help="export a decrypted copy as plain SQLite")
+    export_db.add_argument("--out", required=True)
+    export_db.add_argument("--account", help="account directory name or unique substring")
+    export_db.add_argument("--db", default="nt_msg.db")
+    export_db.set_defaults(func=cmd_export)
 
     return parser
 
@@ -311,6 +357,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (SqlCipherError, LookupError, FileNotFoundError) as exc:
+    except (SqlCipherError, LookupError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
